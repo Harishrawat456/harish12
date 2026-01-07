@@ -1,0 +1,4 @@
+
+variable "ip_config" {
+  
+}

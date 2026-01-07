@@ -1,0 +1,5 @@
+
+
+variable "vm_config" {
+  
+}

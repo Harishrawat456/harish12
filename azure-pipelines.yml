@@ -1,0 +1,120 @@
+# Azure DevOps pipeline for Terraform
+# - Parameters: environmentName (default: dev)
+# - Stages: Validate (fmt + init + validate) -> Plan -> Apply
+# - Apply runs on pushes to main and uses an Azure DevOps Environment for approvals (configure environment checks in the UI)
+# NOTES:
+#  - Create an Azure service connection (ARM) and set its name in pipeline variable: azureServiceConnection
+#  - Configure backend variables (storage account/container/key) via pipeline variables or variable groups
+#  - To run for prod with manual approval: set parameter environmentName=prod and merge to main (approvals on the Environment will gate apply)
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - '*'
+
+parameters:
+- name: environmentName
+  type: string
+  default: 'dev'
+
+variables:
+  terraformVersion: '1.5.0'
+  azureServiceConnection: 'AzureServiceConnection'    # <-- replace with your service connection name
+  backendStorageAccount: ''                           # <-- set via pipeline variables or variable group
+  backendContainerName: ''                            # <-- set via pipeline variables or variable group
+  backendKeyPrefix: 'tfstate'                         # you may customize
+
+stages:
+- stage: Validate
+  displayName: 'Terraform Lint & Validate'
+  jobs:
+  - job: Validate
+    displayName: 'Fmt & Validate'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - script: |
+        cd environments/$(environmentName)
+        terraform fmt -check -recursive
+        terraform init -input=false -backend-config="storage_account_name=$(backendStorageAccount)" -backend-config="container_name=$(backendContainerName)" -backend-config="key=$(backendKeyPrefix)/$(environmentName).tfstate"
+        terraform validate
+      displayName: 'terraform fmt, init & validate'
+
+- stage: Plan
+  displayName: 'Terraform Plan'
+  dependsOn: Validate
+  jobs:
+  - job: Plan
+    displayName: 'Plan'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - script: |
+        cd environments/$(environmentName)
+        terraform init -input=false -backend-config="storage_account_name=$(backendStorageAccount)" -backend-config="container_name=$(backendContainerName)" -backend-config="key=$(backendKeyPrefix)/$(environmentName).tfstate"
+        terraform plan -var-file=terraform.tfvars -out=tfplan
+        terraform show -no-color -json tfplan > plan.json
+      displayName: 'terraform plan'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/environments/$(environmentName)/tfplan'
+        artifact: 'tfplan'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/environments/$(environmentName)/plan.json'
+        artifact: 'planjson'
+
+- stage: Apply
+  displayName: 'Terraform Apply'
+  dependsOn: Plan
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: Apply
+    displayName: 'Apply to $(environmentName)'
+    environment: $(environmentName)   # Use Azure DevOps Environment to require approvals/checks for prod
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '$(terraformVersion)'
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: 'tfplan'
+              path: '$(System.DefaultWorkingDirectory)/environments/$(environmentName)'
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd environments/$(environmentName)
+                terraform init -input=false -backend-config="storage_account_name=$(backendStorageAccount)" -backend-config="container_name=$(backendContainerName)" -backend-config="key=$(backendKeyPrefix)/$(environmentName).tfstate"
+                terraform apply -auto-approve tfplan
+            displayName: 'terraform apply (using Azure service connection)'
